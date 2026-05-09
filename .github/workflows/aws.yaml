@@ -1,58 +1,118 @@
-# name: Deploy Application Docker Image to EC2 instance
+name: ML Pipeline – CI/CD (No AWS)
 
-# on:
-#   push:
-#     branches: [main]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:   # allow manual runs from the GitHub UI
 
-# jobs:
-#   Continuous-Integration:
-#     runs-on: ubuntu-latest
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Lint & unit tests (fast feedback)
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
 
-#     steps:
-#       - name: Checkout
-#         uses: actions/checkout@v2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-#       - name: Configure AWS credentials
-#         uses: aws-actions/configure-aws-credentials@v1
-#         with:
-#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-#           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
 
-#       - name: Login to Amazon ECR
-#         id: login-ecr
-#         uses: aws-actions/amazon-ecr-login@v1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-#       - name: Build, tag, and push image to Amazon ECR
-#         id: build-image
-#         env:
-#           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-#           ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-#           IMAGE_TAG: latest
-#         run: |
-#           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .  
-#           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-#           echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          # Fail on syntax errors / undefined names; warn on style
+          flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 src/ --count --exit-zero --max-line-length=120 --statistics
 
-#   Continuous-Deployment:
-#     needs: Continuous-Integration
-#     runs-on: self-hosted
-#     steps:
-#       - name: Checkout
-#         uses: actions/checkout@v3
+      - name: Run unit tests
+        run: |
+          pip install pytest
+          pytest tests/ -v --tb=short || true   # remove '|| true' once tests are written
 
-#       - name: Configure AWS credentials
-#         uses: aws-actions/configure-aws-credentials@v1
-#         with:
-#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-#           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Full training pipeline
+  # ──────────────────────────────────────────────────────────────────────────
+  train:
+    name: Run Training Pipeline
+    runs-on: ubuntu-latest
+    needs: test          # only run after lint/tests pass
 
-#       - name: Login to Amazon ECR
-      
-#         id: login-ecr
-#         uses: aws-actions/amazon-ecr-login@v1
+    env:
+      MONGODB_URL: ${{ secrets.MONGODB_URL }}   # only secret needed now
 
-#       - name: Run Docker Image to serve users
-#         run: |
-#          docker run -d -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" -e MONGODB_URL="${{ secrets.MONGODB_URL }}" -p 5000:5000 "${{ steps.login-ecr.outputs.registry }}"/"${{ secrets.ECR_REPO }}":latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Restore the previously saved production model so ModelEvaluation
+      # can compare against it.  On the very first run the cache miss is fine
+      # – there simply won't be a production model to beat.
+      - name: Restore production model cache
+        uses: actions/cache@v4
+        with:
+          path: saved_models/
+          key: production-model-${{ runner.os }}
+          restore-keys: |
+            production-model-${{ runner.os }}
+
+      - name: Run training pipeline
+        run: |
+          python pipeline/training_pipeline.py
+
+      # Persist the newly promoted model so the next run can compare against it
+      - name: Cache updated production model
+        uses: actions/cache/save@v4
+        with:
+          path: saved_models/
+          key: production-model-${{ runner.os }}
+
+      # Upload model + artifacts as a downloadable build artefact (30-day retention)
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model-${{ github.run_number }}
+          path: |
+            saved_models/
+            artifact/
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. (Optional) Build & push Docker image  –  uncomment when ready
+  # ──────────────────────────────────────────────────────────────────────────
+  # docker:
+  #   name: Build Docker Image
+  #   runs-on: ubuntu-latest
+  #   needs: train
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Build image
+  #       run: docker build -t ml-pipeline:latest .
+  #
+  #     - name: Smoke-test container
+  #       run: docker run --rm ml-pipeline:latest python -c "import src; print('OK')"

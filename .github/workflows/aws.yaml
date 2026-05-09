@@ -78,7 +78,7 @@ jobs:
         run: |
           CANDIDATES=(
             "pipeline/training_pipeline.py"
-            "src/pipeline/training_pipeline.py"
+            "src/pipline/training_pipeline.py"
             "pipelines/training_pipeline.py"
             "train_pipeline.py"
             "training_pipeline.py"
